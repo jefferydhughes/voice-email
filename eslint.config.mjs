@@ -17,6 +17,9 @@ const eslintConfig = [
       "react-hooks/exhaustive-deps": "off"
     },
   },
+  {
+    ignores: ["**/*.test.ts", "**/*.test.tsx"],
+  },
 ];
 
 export default eslintConfig;
