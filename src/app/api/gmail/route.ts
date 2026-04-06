@@ -4,6 +4,9 @@ import {
   getEmailBody,
   getThreadMessages,
   getUserEmail,
+  searchEmails,
+  findContact,
+  sendNewEmail,
   sendReply,
   archiveEmail,
   markAsRead,
@@ -64,6 +67,18 @@ export async function POST(request: NextRequest) {
       }
       case "markRead": {
         await markAsRead(tokens, params.messageId);
+        return NextResponse.json({ success: true });
+      }
+      case "search": {
+        const emails = await searchEmails(tokens, params.query, params.maxResults || 10);
+        return NextResponse.json({ emails });
+      }
+      case "findContact": {
+        const contacts = await findContact(tokens, params.name);
+        return NextResponse.json({ contacts });
+      }
+      case "compose": {
+        await sendNewEmail(tokens, params.to, params.subject, params.body);
         return NextResponse.json({ success: true });
       }
       default:
