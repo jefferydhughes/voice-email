@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import {
   getUnreadEmails,
   getEmailBody,
+  getThreadMessages,
+  getUserEmail,
   sendReply,
   archiveEmail,
   markAsRead,
@@ -33,11 +35,24 @@ export async function POST(request: NextRequest) {
     switch (action) {
       case "list": {
         const emails = await getUnreadEmails(tokens, params.maxResults || 10);
-        return NextResponse.json({ emails });
+        const userEmail = await getUserEmail(tokens);
+        // Filter out emails where the user is the most recent sender (nothing to act on)
+        const actionable = emails.filter(
+          (e) => !e.from.toLowerCase().includes(userEmail.toLowerCase())
+        );
+        return NextResponse.json({ emails: actionable });
       }
       case "read": {
         const body = await getEmailBody(tokens, params.messageId);
         return NextResponse.json({ body });
+      }
+      case "readThread": {
+        const messages = await getThreadMessages(
+          tokens,
+          params.threadId,
+          params.maxMessages || 5
+        );
+        return NextResponse.json({ messages });
       }
       case "reply": {
         await sendReply(tokens, params.messageId, params.threadId, params.body);

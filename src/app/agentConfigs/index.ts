@@ -1,9 +1,7 @@
-import { emailTriageScenario } from "./emailTriage";
-
 import type { RealtimeAgent } from "@openai/agents/realtime";
 
-export const allAgentSets: Record<string, RealtimeAgent[]> = {
-  emailTriage: emailTriageScenario,
-};
+// The emailTriage agent is now created dynamically via createEmailTriageAgent().
+// This registry is kept for compatibility with other agent sets.
+export const allAgentSets: Record<string, RealtimeAgent[]> = {};
 
 export const defaultAgentSetKey = "emailTriage";

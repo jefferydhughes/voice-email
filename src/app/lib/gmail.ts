@@ -65,10 +65,18 @@ function getGmail(tokens: any) {
   return google.gmail({ version: "v1", auth: getAuthedClient(tokens) });
 }
 
+export async function getUserEmail(tokens: any): Promise<string> {
+  const gmail = getGmail(tokens);
+  const profile = await gmail.users.getProfile({ userId: "me" });
+  return profile.data.emailAddress || "";
+}
+
 export interface EmailSummary {
   id: string;
   threadId: string;
   from: string;
+  to: string;
+  cc: string;
   subject: string;
   snippet: string;
   date: string;
@@ -87,30 +95,56 @@ export async function getUnreadEmails(
 
   if (!res.data.messages) return [];
 
-  const emails: EmailSummary[] = [];
-  for (const msg of res.data.messages) {
-    const detail = await gmail.users.messages.get({
-      userId: "me",
-      id: msg.id!,
-      format: "metadata",
-      metadataHeaders: ["From", "Subject", "Date"],
-    });
+  const emails: EmailSummary[] = await Promise.all(
+    res.data.messages.map(async (msg) => {
+      const detail = await gmail.users.messages.get({
+        userId: "me",
+        id: msg.id!,
+        format: "metadata",
+        metadataHeaders: ["From", "To", "Cc", "Subject", "Date"],
+      });
 
-    const headers = detail.data.payload?.headers || [];
-    const getHeader = (name: string) =>
-      headers.find((h) => h.name === name)?.value || "";
+      const headers = detail.data.payload?.headers || [];
+      const getHeader = (name: string) =>
+        headers.find((h) => h.name === name)?.value || "";
 
-    emails.push({
-      id: msg.id!,
-      threadId: msg.threadId!,
-      from: getHeader("From"),
-      subject: getHeader("Subject"),
-      snippet: detail.data.snippet || "",
-      date: getHeader("Date"),
-    });
-  }
+      return {
+        id: msg.id!,
+        threadId: msg.threadId!,
+        from: getHeader("From"),
+        to: getHeader("To"),
+        cc: getHeader("Cc"),
+        subject: getHeader("Subject"),
+        snippet: detail.data.snippet || "",
+        date: getHeader("Date"),
+      };
+    })
+  );
 
   return emails;
+}
+
+export function truncateToLatestMessage(body: string, maxLength = 2000): string {
+  const separators = [
+    /\r?\nOn .+wrote:\r?\n/,
+    /\r?\n-{3,}Original Message-{3,}\r?\n/,
+    /\r?\nFrom: .+\r?\nSent: /,
+  ];
+
+  let truncated = body;
+  for (const sep of separators) {
+    const match = truncated.search(sep);
+    if (match > 0) {
+      truncated = truncated.substring(0, match);
+      break;
+    }
+  }
+
+  truncated = truncated.trim();
+  if (truncated.length > maxLength) {
+    truncated = truncated.substring(0, maxLength) + "...";
+  }
+  return truncated;
 }
 
 export async function getEmailBody(
@@ -148,6 +182,57 @@ export async function getEmailBody(
   }
 
   return res.data.snippet || "";
+}
+
+export async function getThreadMessages(
+  tokens: any,
+  threadId: string,
+  maxMessages = 5
+): Promise<{ from: string; date: string; body: string }[]> {
+  const gmail = getGmail(tokens);
+  const thread = await gmail.users.threads.get({
+    userId: "me",
+    id: threadId,
+    format: "full",
+  });
+
+  const messages = thread.data.messages || [];
+  // Take the last N messages (most recent context)
+  const recent = messages.slice(-maxMessages);
+
+  return recent.map((msg) => {
+    const headers = msg.payload?.headers || [];
+    const getHeader = (name: string) =>
+      headers.find((h) => h.name === name)?.value || "";
+
+    function extractText(parts: any[]): string {
+      for (const part of parts) {
+        if (part.mimeType === "text/plain" && part.body?.data) {
+          return Buffer.from(part.body.data, "base64url").toString("utf-8");
+        }
+        if (part.parts) {
+          const text = extractText(part.parts);
+          if (text) return text;
+        }
+      }
+      return "";
+    }
+
+    let rawText = "";
+    if (msg.payload?.body?.data) {
+      rawText = Buffer.from(msg.payload.body.data, "base64url").toString("utf-8");
+    } else if (msg.payload?.parts) {
+      rawText = extractText(msg.payload.parts);
+    } else {
+      rawText = msg.snippet || "";
+    }
+
+    return {
+      from: getHeader("From"),
+      date: getHeader("Date"),
+      body: rawText,
+    };
+  });
 }
 
 export async function sendReply(

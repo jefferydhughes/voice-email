@@ -1,5 +1,5 @@
 "use client";
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 
 import { SessionStatus } from "@/app/types";
 
@@ -7,7 +7,10 @@ import { useTranscript } from "@/app/contexts/TranscriptContext";
 import { useEvent } from "@/app/contexts/EventContext";
 import { useRealtimeSession } from "./hooks/useRealtimeSession";
 
-import { emailTriageScenario } from "@/app/agentConfigs/emailTriage";
+import {
+  createEmailTriageAgent,
+  EmailData,
+} from "@/app/agentConfigs/emailTriage";
 
 function App() {
   const { addTranscriptMessage, addTranscriptBreadcrumb, transcriptItems } =
@@ -31,16 +34,39 @@ function App() {
     }
   }, [sdkAudioElement]);
 
+  // Email state (populated by agent tools)
+  const emailsRef = useRef<EmailData[]>([]);
+  const emailIndexRef = useRef<number>(0);
+  const actionsRef = useRef({ replied: 0, skipped: 0, archived: 0 });
+
+  // Reconnection state
+  const connectOptionsRef = useRef<{
+    agent: ReturnType<typeof createEmailTriageAgent>;
+  } | null>(null);
+  const reconnectAttemptRef = useRef(0);
+  const isReconnectingRef = useRef(false);
+  const isManualDisconnectRef = useRef(false);
+  const maxReconnectAttempts = 5;
+
   const { connect, disconnect, sendEvent } =
     useRealtimeSession({
-      onConnectionChange: (s) => setSessionStatus(s as SessionStatus),
+      onConnectionChange: (s) => {
+        if (
+          s === "DISCONNECTED" &&
+          !isManualDisconnectRef.current &&
+          connectOptionsRef.current &&
+          !isReconnectingRef.current
+        ) {
+          handleSessionDrop();
+        }
+        setSessionStatus(s);
+      },
     });
 
   const [sessionStatus, setSessionStatus] =
     useState<SessionStatus>("DISCONNECTED");
   const [isAuthenticated, setIsAuthenticated] = useState<boolean | null>(null);
 
-  // Check Gmail auth status on load
   useEffect(() => {
     fetch("/api/auth/status")
       .then((r) => r.json())
@@ -64,22 +90,148 @@ function App() {
     return data.client_secret.value;
   };
 
-  const connectToRealtime = async () => {
-    if (sessionStatus !== "DISCONNECTED") return;
+  const handleSessionDrop = useCallback(async () => {
+    if (reconnectAttemptRef.current >= maxReconnectAttempts) {
+      setSessionStatus("DISCONNECTED");
+      isReconnectingRef.current = false;
+      console.log("session_reconnect_failed: max_attempts_reached");
+      try {
+        await fetch("/api/log", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            event: "session_reconnect_failed",
+            data: { reason: "max_attempts" },
+          }),
+        });
+      } catch {}
+      return;
+    }
+
+    isReconnectingRef.current = true;
+    const attempt = reconnectAttemptRef.current++;
+    const delay = Math.min(1000 * Math.pow(2, attempt), 16000);
+
     setSessionStatus("CONNECTING");
 
+    if (typeof speechSynthesis !== "undefined") {
+      const utterance = new SpeechSynthesisUtterance(
+        "Connection lost. Reconnecting."
+      );
+      speechSynthesis.speak(utterance);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, delay));
+
     try {
+      const opts = connectOptionsRef.current;
+      if (!opts) return;
+
       const EPHEMERAL_KEY = await fetchEphemeralKey();
-      if (!EPHEMERAL_KEY) return;
+      if (!EPHEMERAL_KEY) {
+        handleSessionDrop();
+        return;
+      }
 
       await connect({
         getEphemeralKey: async () => EPHEMERAL_KEY,
-        initialAgents: emailTriageScenario,
+        initialAgents: [opts.agent],
         audioElement: sdkAudioElement,
         extraContext: { addTranscriptBreadcrumb },
       });
 
-      // Send initial message to trigger the greeting
+      setTimeout(() => {
+        sendEvent({
+          type: "session.update",
+          session: {
+            turn_detection: {
+              type: "server_vad",
+              threshold: 0.9,
+              prefix_padding_ms: 300,
+              silence_duration_ms: 500,
+              create_response: true,
+            },
+          },
+        });
+
+        const id = crypto.randomUUID().replace(/-/g, "").slice(0, 32);
+        addTranscriptMessage(id, "user", "I'm back, continue where we left off", true);
+        sendEvent({
+          type: "conversation.item.create",
+          item: {
+            id,
+            type: "message",
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: "I'm back, continue where we left off with the next email",
+              },
+            ],
+          },
+        });
+        sendEvent({ type: "response.create" });
+      }, 500);
+
+      reconnectAttemptRef.current = 0;
+      isReconnectingRef.current = false;
+
+      console.log(`session_reconnected: attempt=${attempt + 1}`);
+      try {
+        await fetch("/api/log", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            event: "session_reconnected",
+            data: { attempt: attempt + 1 },
+          }),
+        });
+      } catch {}
+    } catch (err) {
+      console.error("Reconnection failed:", err);
+      handleSessionDrop();
+    }
+  }, [connect, sdkAudioElement, sendEvent, addTranscriptBreadcrumb, addTranscriptMessage]);
+
+  const connectToRealtime = async () => {
+    if (sessionStatus !== "DISCONNECTED") return;
+    setSessionStatus("CONNECTING");
+    isManualDisconnectRef.current = false;
+
+    try {
+      // Reset state
+      emailsRef.current = [];
+      emailIndexRef.current = 0;
+      actionsRef.current = { replied: 0, skipped: 0, archived: 0 };
+
+      // Create agent with deps — emails will be populated by get_email_count tool
+      const agent = createEmailTriageAgent({
+        emails: () => emailsRef.current,
+        setEmails: (emails) => { emailsRef.current = emails; },
+        emailIndex: () => emailIndexRef.current,
+        advanceIndex: () => { emailIndexRef.current += 1; },
+        recordAction: (action) => {
+          actionsRef.current = {
+            ...actionsRef.current,
+            [action === "reply" ? "replied" : action === "skip" ? "skipped" : "archived"]:
+              actionsRef.current[action === "reply" ? "replied" : action === "skip" ? "skipped" : "archived"] + 1,
+          };
+        },
+        getActionSummary: () => ({ ...actionsRef.current }),
+      });
+
+      const EPHEMERAL_KEY = await fetchEphemeralKey();
+      if (!EPHEMERAL_KEY) return;
+
+      connectOptionsRef.current = { agent };
+
+      await connect({
+        getEphemeralKey: async () => EPHEMERAL_KEY,
+        initialAgents: [agent],
+        audioElement: sdkAudioElement,
+        extraContext: { addTranscriptBreadcrumb },
+      });
+
       setTimeout(() => {
         sendEvent({
           type: "session.update",
@@ -114,6 +266,10 @@ function App() {
   };
 
   const disconnectFromRealtime = () => {
+    isManualDisconnectRef.current = true;
+    isReconnectingRef.current = false;
+    reconnectAttemptRef.current = 0;
+    connectOptionsRef.current = null;
     disconnect();
     setSessionStatus("DISCONNECTED");
   };
@@ -126,7 +282,6 @@ function App() {
     }
   };
 
-  // Get the latest transcript messages for display
   const messages = transcriptItems
     .filter((item) => item.type === "MESSAGE" && !item.isHidden)
     .sort((a, b) => a.createdAtMs - b.createdAtMs);
@@ -135,7 +290,6 @@ function App() {
   const isConnected = sessionStatus === "CONNECTED";
   const isConnecting = sessionStatus === "CONNECTING";
 
-  // Auth gate
   if (isAuthenticated === null) {
     return (
       <div className="flex items-center justify-center h-screen bg-gray-950 text-white">
@@ -164,13 +318,11 @@ function App() {
 
   return (
     <div className="flex flex-col items-center justify-between h-screen bg-gray-950 text-white px-6 py-10 select-none">
-      {/* Header */}
       <div className="text-center">
         <h1 className="text-2xl font-bold tracking-tight">Voice Nav</h1>
         <p className="text-gray-500 text-sm mt-1">Hands-free email</p>
       </div>
 
-      {/* Status / Transcript area */}
       <div className="flex-1 flex flex-col items-center justify-center w-full max-w-lg gap-4">
         {isConnected && latestMessage && (
           <div className="text-center px-4">
@@ -190,7 +342,7 @@ function App() {
         )}
         {isConnecting && (
           <div className="text-gray-400 text-lg animate-pulse">
-            Connecting...
+            {isReconnectingRef.current ? "Reconnecting..." : "Connecting..."}
           </div>
         )}
         {!isConnected && !isConnecting && (
@@ -200,7 +352,6 @@ function App() {
         )}
       </div>
 
-      {/* Big connect/disconnect button */}
       <button
         onClick={onToggleConnection}
         disabled={isConnecting}
