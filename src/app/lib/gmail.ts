@@ -301,3 +301,135 @@ export async function markAsRead(
     requestBody: { removeLabelIds: ["UNREAD"] },
   });
 }
+
+export async function searchEmails(
+  tokens: any,
+  query: string,
+  maxResults = 10
+): Promise<EmailSummary[]> {
+  const gmail = getGmail(tokens);
+  const res = await gmail.users.messages.list({
+    userId: "me",
+    q: query,
+    maxResults,
+  });
+
+  if (!res.data.messages) return [];
+
+  const emails: EmailSummary[] = await Promise.all(
+    res.data.messages.map(async (msg) => {
+      const detail = await gmail.users.messages.get({
+        userId: "me",
+        id: msg.id!,
+        format: "metadata",
+        metadataHeaders: ["From", "To", "Cc", "Subject", "Date"],
+      });
+
+      const headers = detail.data.payload?.headers || [];
+      const getHeader = (name: string) =>
+        headers.find((h) => h.name === name)?.value || "";
+
+      return {
+        id: msg.id!,
+        threadId: msg.threadId!,
+        from: getHeader("From"),
+        to: getHeader("To"),
+        cc: getHeader("Cc"),
+        subject: getHeader("Subject"),
+        snippet: detail.data.snippet || "",
+        date: getHeader("Date"),
+      };
+    })
+  );
+
+  return emails;
+}
+
+export async function findContact(
+  tokens: any,
+  name: string
+): Promise<{ name: string; email: string }[]> {
+  const gmail = getGmail(tokens);
+  // Search for recent emails involving this person
+  const res = await gmail.users.messages.list({
+    userId: "me",
+    q: name,
+    maxResults: 20,
+  });
+
+  if (!res.data.messages) return [];
+
+  const details = await Promise.all(
+    res.data.messages.map(async (msg) => {
+      const detail = await gmail.users.messages.get({
+        userId: "me",
+        id: msg.id!,
+        format: "metadata",
+        metadataHeaders: ["From", "To", "Cc"],
+      });
+      return detail.data.payload?.headers || [];
+    })
+  );
+
+  // Extract all email addresses from From/To/Cc headers
+  const nameLower = name.toLowerCase();
+  const contactMap = new Map<string, { name: string; email: string; count: number }>();
+
+  for (const headers of details) {
+    for (const h of headers) {
+      if (!h.value) continue;
+      // Parse addresses like "Denisa Smith <denisa@example.com>" or bare "denisa@example.com"
+      const addresses = h.value.split(",").map((a) => a.trim());
+      for (const addr of addresses) {
+        const match = addr.match(/^(.+?)\s*<(.+?)>$/);
+        const displayName = match ? match[1].trim().replace(/^"|"$/g, "") : "";
+        const email = match ? match[2].trim().toLowerCase() : addr.trim().toLowerCase();
+
+        if (
+          displayName.toLowerCase().includes(nameLower) ||
+          email.includes(nameLower)
+        ) {
+          const existing = contactMap.get(email);
+          if (existing) {
+            existing.count++;
+          } else {
+            contactMap.set(email, {
+              name: displayName || email,
+              email,
+              count: 1,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // Sort by frequency (most emailed first)
+  return Array.from(contactMap.values())
+    .sort((a, b) => b.count - a.count)
+    .map(({ name, email }) => ({ name, email }));
+}
+
+export async function sendNewEmail(
+  tokens: any,
+  to: string,
+  subject: string,
+  body: string
+): Promise<void> {
+  const gmail = getGmail(tokens);
+
+  const raw = [
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    `Content-Type: text/plain; charset="UTF-8"`,
+    "",
+    body,
+  ].join("\r\n");
+
+  const encoded = Buffer.from(raw).toString("base64url");
+
+  await gmail.users.messages.send({
+    userId: "me",
+    requestBody: { raw: encoded },
+  });
+}

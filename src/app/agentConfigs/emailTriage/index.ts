@@ -55,6 +55,11 @@ NEVER invent, guess, or assume any email content. You MUST call get_email_count 
 6. When get_next_email returns done=true, let them know they're all caught up and give the session summary.
 7. When the user says "I'm done", "that's all", "wrap up", or similar, call get_session_summary. Announce it naturally: "All set. You replied to X, skipped Y, and archived Z. You still have N left for later. Have a great day!"
 
+# Search & Compose
+- The user can ask to find old emails at any time (e.g., "Did Sarah send me that report?"). Use search_emails with Gmail search syntax.
+- The user can ask to send a new email (e.g., "Send an email to Denisa"). Use find_contact to resolve the name to an email address. If multiple matches, read the top 2-3 and ask which one. Then ask what they want to say, draft it, read it back, and confirm before sending with send_new_email.
+- Always confirm recipient, subject, and body before sending a new email.
+
 # Prioritization
 When you receive the email list from get_email_count, mentally sort them. Present emails in this order:
 - URGENT first: direct asks, deadlines, board/investor emails, people issues, anything time-sensitive
@@ -286,6 +291,114 @@ You decide the order — use your judgment. The user trusts you to surface the i
           if (data.error) return { error: data.error };
           deps.recordAction("skip");
           return { success: true, message: "Email marked as read." };
+        },
+      }),
+
+      tool({
+        name: "search_emails",
+        description:
+          "Search the user's email history. Use Gmail search syntax (e.g. 'from:john budget', 'subject:Q3 report', 'to:me project update'). Call this when the user asks about a past email or wants to find something.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description:
+                "Gmail search query. Examples: 'from:sarah invoice', 'subject:board deck', 'budget Q3', 'has:attachment from:john'",
+            },
+            max_results: {
+              type: "number",
+              description: "Number of results to return. Defaults to 5.",
+            },
+          },
+          required: ["query"],
+          additionalProperties: false,
+        },
+        execute: async (args: any) => {
+          const data = await gmailApi({
+            action: "search",
+            query: args.query,
+            maxResults: args.max_results || 5,
+          });
+          if (data.error) return { error: data.error };
+          return {
+            count: data.emails?.length || 0,
+            emails: (data.emails || []).map((e: any) => ({
+              id: e.id,
+              threadId: e.threadId,
+              from: e.from,
+              to: e.to,
+              subject: e.subject,
+              snippet: e.snippet,
+              date: e.date,
+            })),
+          };
+        },
+      }),
+
+      tool({
+        name: "find_contact",
+        description:
+          "Find someone's email address by name. Searches the user's email history for messages involving that person and returns matching contacts sorted by how often they appear. Call this when the user wants to send an email to someone by name.",
+        parameters: {
+          type: "object",
+          properties: {
+            name: {
+              type: "string",
+              description: "The person's name to search for (e.g. 'Denisa', 'John Smith')",
+            },
+          },
+          required: ["name"],
+          additionalProperties: false,
+        },
+        execute: async (args: any) => {
+          const data = await gmailApi({
+            action: "findContact",
+            name: args.name,
+          });
+          if (data.error) return { error: data.error };
+          return {
+            contacts: data.contacts || [],
+            message:
+              data.contacts?.length > 0
+                ? `Found ${data.contacts.length} match(es). The most frequent contact is ${data.contacts[0].name} <${data.contacts[0].email}>.`
+                : "No contacts found with that name.",
+          };
+        },
+      }),
+
+      tool({
+        name: "send_new_email",
+        description:
+          "Compose and send a new email (not a reply). Only call this after confirming the recipient, subject, and body with the user. Use find_contact first if the user gives a name instead of an email address.",
+        parameters: {
+          type: "object",
+          properties: {
+            to: {
+              type: "string",
+              description: "Recipient email address",
+            },
+            subject: {
+              type: "string",
+              description: "Email subject line",
+            },
+            body: {
+              type: "string",
+              description: "Email body text",
+            },
+          },
+          required: ["to", "subject", "body"],
+          additionalProperties: false,
+        },
+        execute: async (args: any) => {
+          const data = await gmailApi({
+            action: "compose",
+            to: args.to,
+            subject: args.subject,
+            body: args.body,
+          });
+          if (data.error) return { error: data.error };
+          return { success: true, message: "Email sent." };
         },
       }),
 
